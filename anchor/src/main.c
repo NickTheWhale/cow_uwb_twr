@@ -24,6 +24,8 @@
 #include <drivers/dw1000/deca_spi.h>
 #include <drivers/dw1000/port.h>
 
+#include <zephyr/drivers/hwinfo.h>
+#include <zephyr/timing/timing.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
 
@@ -55,23 +57,23 @@ static dwt_config_t config = {
 
 /* Frames used in the ranging process. See NOTE 2 below. */
 static uint8 ranging_request_msg[] = {
-    0x41, 0x45, /* Type */
     0, 0, 0, 0, 0, 0, 0, 0, /* Tag device id */
     0, 0, 0, 0, 0, 0, 0, 0, /* Anchor device id */
+    0x52, 0x00, /* Type */
     0, 0 /* Checksum*/
 };
 
-static uint8 ranging_request_response[] = {
-    0x56, 0x34, /* Type */
+static uint8 ranging_request_response_msg[] = {
     0, 0, 0, 0, 0, 0, 0, 0, /* Tag device id */
     0, 0, 0, 0, 0, 0, 0, 0, /* Anchor device id */
+    0x52, 0x01, /* Type */
     0, 0 /* Checksum*/  
 };
 
-static uint8 ranging_final_message[] = {
-    0x21, 0x37, /* Type */
+static uint8 ranging_final_msg[] = {
     0, 0, 0, 0, 0, 0, 0, 0, /* Tag device id */
     0, 0, 0, 0, 0, 0, 0, 0, /* Anchor device id */
+    0x52, 0x02, /* Type */
     0, 0, 0, 0, /* Ranging request transmission timestamp */
     0, 0, 0, 0, /* Ranging request response reception timestamp */
     0, 0, 0, 0, /* Final ranging transmission timestamp */
@@ -79,16 +81,16 @@ static uint8 ranging_final_message[] = {
 };
 
 static uint8 distance_relay_msg[] = {
-    0x41, 0x45, /* Type */
     0, 0, 0, 0, 0, 0, 0, 0, /* Tag device id */
     0, 0, 0, 0, 0, 0, 0, 0, /* Anchor device id */
-    0, 0, /* Checksum*/
-    0, 0, 0, 0 /* Distance (mm)*/
+    0x52, 0x03, /* Type */
+    0, 0, 0, 0, /* Distance (mm)*/
+    0, 0 /* Checksum*/
 };
 
-#define DEVICE_ID_LEN 8
-static uint8 tag_device_id[DEVICE_ID_LEN] = {0};
-static uint8 anchor_device_id[DEVICE_ID_LEN] = {0};
+#define DEVICE_UUID_LEN 8
+// static uint8 tag_device_id[DEVICE_UUID_LEN] = {0};
+// static uint8 anchor_device_id[DEVICE_UUID_LEN] = {0};
 
 // static uint8 rx_poll_msg[] = {0x41, 0x88, 0, 0xCA, 0xDE, 'W', 'A', 'V', 'E', 0x21, 0, 0};
 // static uint8 tx_resp_msg[] = {0x41, 0x88, 0, 0xCA, 0xDE, 'V', 'E', 'W', 'A', 0x10, 0x02, 0, 0, 0, 0};
@@ -96,11 +98,14 @@ static uint8 anchor_device_id[DEVICE_ID_LEN] = {0};
 // static uint8 rx_device_id[8] = {0};
 /* Length of the common part of the message (up to and including the function code, see NOTE 2 below). */
 
-#define ALL_MSG_COMMONG_LEN 18
+#define ALL_MSG_COMMON_LEN 16
 #define FINAL_MSG_POLL_TX_TS_IDX 18
 #define FINAL_MSG_RESP_RX_TS_IDX 22
 #define FINAL_MSG_FINAL_TX_TS_IDX 26
 #define FINAL_MSG_TS_LEN 4
+#define RELAY_MSG_DISTANCE_IDX 18
+#define TAG_UUID_IDX 0
+#define ANCHOR_UUID_IDX 8
 
 // #define ALL_MSG_COMMON_LEN 10
 // #define DEVICE_ID_IDX 10
@@ -202,6 +207,17 @@ int main(void)
     /* Configure DW1000 LEDs */
     dwt_setleds(1);
 
+    /* Add anchor UUID to ranging messages */
+    uint8_t hwid_buffer[8];
+    hwinfo_get_device_id(hwid_buffer, 8);
+
+    memcpy(&ranging_request_msg[ANCHOR_UUID_IDX], hwid_buffer, sizeof(hwid_buffer));
+    memcpy(&ranging_request_response_msg[ANCHOR_UUID_IDX], hwid_buffer, sizeof(hwid_buffer));
+    memcpy(&ranging_final_msg[ANCHOR_UUID_IDX], hwid_buffer, sizeof(hwid_buffer));
+    memcpy(&distance_relay_msg[ANCHOR_UUID_IDX], hwid_buffer, sizeof(hwid_buffer));
+
+    LOG_HEXDUMP_INF(hwid_buffer, sizeof(hwid_buffer), "Device ID");
+
     /* Loop forever responding to ranging requests. */
     while (1)
     {
@@ -230,12 +246,15 @@ int main(void)
                 dwt_readrxdata(rx_buffer, frame_len, 0);
             }
 
-            /* Check that the frame is a poll sent by "DS TWR initiator" example.
-             * As the sequence number field of the frame is not relevant, it is cleared to simplify the validation of the frame. */
-            if (memcmp(rx_buffer, rx_poll_msg, ALL_MSG_COMMON_LEN) == 0)
+            /* Check that the frame is a poll sent by "DS TWR initiator" example. */            
+            memcpy(&ranging_request_msg[TAG_UUID_IDX], &rx_buffer[TAG_UUID_IDX], DEVICE_UUID_LEN);
+            memcpy(&ranging_request_response_msg[TAG_UUID_IDX], &rx_buffer[TAG_UUID_IDX], DEVICE_UUID_LEN);
+            memcpy(&ranging_final_msg[TAG_UUID_IDX], &rx_buffer[TAG_UUID_IDX], DEVICE_UUID_LEN);
+            memcpy(&distance_relay_msg[TAG_UUID_IDX], &rx_buffer[TAG_UUID_IDX], DEVICE_UUID_LEN);
+
+            if (memcmp(rx_buffer, ranging_request_msg, ALL_MSG_COMMON_LEN) == 0)
             {
                 /* Store device id */
-                memcpy(rx_device_id, &rx_buffer[DEVICE_ID_IDX], sizeof(rx_device_id));
                 uint32 resp_tx_time;
                 int ret;
 
@@ -243,7 +262,7 @@ int main(void)
                 poll_rx_ts = get_rx_timestamp_u64();
 
                 /* Retreive frame sequence number */
-                memcpy(&frame_seq_nb_rx, &rx_buffer[2], 1);
+                // memcpy(&frame_seq_nb_rx, &rx_buffer[2], 1);
 
                 /* Set send time for response. See NOTE 9 below. */
                 resp_tx_time = (poll_rx_ts + (POLL_RX_TO_RESP_TX_DLY_UUS * UUS_TO_DWT_TIME)) >> 8;
@@ -254,9 +273,9 @@ int main(void)
                 dwt_setrxtimeout(FINAL_RX_TIMEOUT_UUS);
 
                 /* Write and send the response message. See NOTE 10 below.*/
-                tx_resp_msg[ALL_MSG_SN_IDX] = frame_seq_nb;
-                dwt_writetxdata(sizeof(tx_resp_msg), tx_resp_msg, 0); /* Zero offset in TX buffer. */
-                dwt_writetxfctrl(sizeof(tx_resp_msg), 0, 1);          /* Zero offset in TX buffer, ranging. */
+                // tx_resp_msg[ALL_MSG_SN_IDX] = frame_seq_nb;
+                dwt_writetxdata(sizeof(ranging_request_response_msg), ranging_request_response_msg, 0); /* Zero offset in TX buffer. */
+                dwt_writetxfctrl(sizeof(ranging_request_response_msg), 0, 1);          /* Zero offset in TX buffer, ranging. */
                 ret = dwt_starttx(DWT_START_TX_DELAYED | DWT_RESPONSE_EXPECTED);
 
                 /* If dwt_starttx() returns an error, abandon this ranging exchange and proceed to the next one. See NOTE 11 below. */
@@ -272,7 +291,7 @@ int main(void)
                 };
 
                 /* Increment frame sequence number after transmission of the response message (modulo 256). */
-                frame_seq_nb++;
+                // frame_seq_nb++;
 
                 if (status_reg & SYS_STATUS_RXFCG)
                 {
@@ -288,17 +307,9 @@ int main(void)
 
                     /* Check that the frame is a final message sent by "DS TWR initiator" example.
                      * As the sequence number field of the frame is not used in this example, it can be zeroed to ease the validation of the frame. */
-                    rx_buffer[ALL_MSG_SN_IDX] = 0;
-                    if (memcmp(rx_buffer, rx_final_msg, ALL_MSG_COMMON_LEN) == 0)
+                    // rx_buffer[ALL_MSG_SN_IDX] = 0;
+                    if (memcmp(rx_buffer, ranging_final_msg, ALL_MSG_COMMON_LEN) == 0)
                     {
-                        if (memcmp(rx_buffer + ALL_MSG_COMMON_LEN, rx_device_id, 8) != 0)
-                        {
-                            LOG_INF("different device id's");
-                        }
-                        else
-                        {
-                            LOG_INF("same device id's");
-                        }
                         uint32 poll_tx_ts, resp_rx_ts, final_tx_ts;
                         uint32 poll_rx_ts_32, resp_tx_ts_32, final_rx_ts_32;
                         double Ra, Rb, Da, Db;
@@ -326,19 +337,16 @@ int main(void)
                         tof = tof_dtu * DWT_TIME_UNITS;
                         distance = tof * SPEED_OF_LIGHT;
 
-/* Convert double distance to byte buffer. Last two bytes are for checksum. */
-#define TX_DISTANCE_MSG_LENGTH 6
-                        uint8 tx_distance_msg[TX_DISTANCE_MSG_LENGTH] = {0, 0, 0, 0, 0, 0};
-
                         uint32_t distance_mm = distance * 1000000;
-                        for (int i = 0; i < TX_DISTANCE_MSG_LENGTH; ++i)
+
+                        for (int i = 0; i < 4; ++i)
                         {
-                            tx_distance_msg[i] = (distance_mm >> i * 8) & 0xFF;
+                            distance_relay_msg[i + RELAY_MSG_DISTANCE_IDX] = (distance_mm >> i * 8) & 0xFF;
                         }
 
                         /* Send distance buffer to tag*/
-                        dwt_writetxdata(sizeof(tx_distance_msg), tx_distance_msg, 0);
-                        dwt_writetxfctrl(sizeof(tx_distance_msg), 0, 0);
+                        dwt_writetxdata(sizeof(distance_relay_msg), distance_relay_msg, 0);
+                        dwt_writetxfctrl(sizeof(distance_relay_msg), 0, 0);
 
                         int ret = dwt_starttx(DWT_START_TX_IMMEDIATE);
                         if (ret == DWT_ERROR)

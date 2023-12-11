@@ -56,7 +56,7 @@ LOG_MODULE_REGISTER(main, LOG_LEVEL_DBG);
 #define APP_LINE "================="
 
 /* Inter-ranging delay period, in milliseconds. */
-#define RNG_DELAY_MS 2000
+#define LOOP_DELAY_MS 500
 
 /* Default communication configuration. */
 static dwt_config_t config = {
@@ -77,25 +77,53 @@ static dwt_config_t config = {
 #define RX_ANT_DLY 16436
 
 /* Frames used in the ranging process. See NOTE 2 below. */
-static uint8 tx_poll_msg[] = {0x41, 0x88, 0, 0xCA, 0xDE, 'W', 'A', 'V', 'E', 0x21, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
-static uint8 rx_resp_msg[] = {0x41, 0x88, 0, 0xCA, 0xDE, 'V', 'E', 'W', 'A', 0x10, 0x02, 0, 0, 0, 0};
-static uint8 tx_final_msg[] = {0x41, 0x88, 0, 0xCA, 0xDE, 'W', 'A', 'V', 'E', 0x23, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
-/* Length of the common part of the message (up to and including the function code, see NOTE 2 below). */
-#define ALL_MSG_COMMON_LEN 10
-#define DEVICE_ID_IDX 10
-#define DEVICE_ID_LEN 8
-/* Indexes to access some of the fields in the frames defined above. */
-#define ALL_MSG_SN_IDX 2
-#define FINAL_MSG_POLL_TX_TS_IDX 10
-#define FINAL_MSG_RESP_RX_TS_IDX 14
-#define FINAL_MSG_FINAL_TX_TS_IDX 18
+static uint8 ranging_request_msg[] = {
+    0, 0, 0, 0, 0, 0, 0, 0, /* Tag device id */
+    0, 0, 0, 0, 0, 0, 0, 0, /* Anchor device id */
+    0x52, 0x00, /* Type */
+    0, 0 /* Checksum*/
+};
+
+static uint8 ranging_request_response_msg[] = {
+    0, 0, 0, 0, 0, 0, 0, 0, /* Tag device id */
+    0, 0, 0, 0, 0, 0, 0, 0, /* Anchor device id */
+    0x52, 0x01, /* Type */
+    0, 0 /* Checksum*/  
+};
+
+static uint8 ranging_final_msg[] = {
+    0, 0, 0, 0, 0, 0, 0, 0, /* Tag device id */
+    0, 0, 0, 0, 0, 0, 0, 0, /* Anchor device id */
+    0x52, 0x02, /* Type */
+    0, 0, 0, 0, /* Ranging request transmission timestamp */
+    0, 0, 0, 0, /* Ranging request response reception timestamp */
+    0, 0, 0, 0, /* Final ranging transmission timestamp */
+    0, 0 /* Checksum*/  
+};
+
+static uint8 distance_relay_msg[] = {
+    0, 0, 0, 0, 0, 0, 0, 0, /* Tag device id */
+    0, 0, 0, 0, 0, 0, 0, 0, /* Anchor device id */
+    0x52, 0x03, /* Type */
+    0, 0, 0, 0, /* Distance (mm)*/
+    0, 0 /* Checksum*/
+};
+
+#define DEVICE_UUID_LEN 8
+
+#define ALL_MSG_COMMON_LEN 16
+#define FINAL_MSG_POLL_TX_TS_IDX 18
+#define FINAL_MSG_RESP_RX_TS_IDX 22
+#define FINAL_MSG_FINAL_TX_TS_IDX 26
 #define FINAL_MSG_TS_LEN 4
-/* Frame sequence number, incremented after each transmission. */
-static uint8 frame_seq_nb = 0;
+#define RELAY_MSG_DISTANCE_IDX 18
+#define TAG_UUID_IDX 0
+#define ANCHOR_UUID_IDX 8
+
 
 /* Buffer to store received response message.
  * Its size is adjusted to longest frame that this example code is supposed to handle. */
-#define RX_BUF_LEN 20
+#define RX_BUF_LEN 32
 static uint8 rx_buffer[RX_BUF_LEN];
 
 /* Hold copy of status register state here for reference so that it can be examined at a debug breakpoint. */
@@ -182,16 +210,56 @@ int main(void)
     /* Configure DW1000 LEDs */
     dwt_setleds(1);
 
-    /* Add unique hardware id to ranging request tx buffer*/
-    uint8_t hwid_buffer[8] = {};
-    int id_len = hwinfo_get_device_id(hwid_buffer, 8);
-    memcpy(&tx_poll_msg[DEVICE_ID_IDX], hwid_buffer, sizeof(hwid_buffer));
+    /* Add anchor UUID to ranging messages */
+    uint8_t hwid_buffer[8];
+    hwinfo_get_device_id(hwid_buffer, 8);
+
+    memcpy(&ranging_request_msg[TAG_UUID_IDX], hwid_buffer, sizeof(hwid_buffer));
+    memcpy(&ranging_request_response_msg[TAG_UUID_IDX], hwid_buffer, sizeof(hwid_buffer));
+    memcpy(&ranging_final_msg[TAG_UUID_IDX], hwid_buffer, sizeof(hwid_buffer));
+    memcpy(&distance_relay_msg[TAG_UUID_IDX], hwid_buffer, sizeof(hwid_buffer));
 
     LOG_HEXDUMP_INF(hwid_buffer, sizeof(hwid_buffer), "Device ID");
+    
+    // uint8 test_anchor_uuid[] = {0xb9, 0x1c, 0x2e, 0x64, 0xe3, 0x31, 0x82, 0x70};
+    // uint8 test_anchor_uuid[] = {0x6e, 0x18, 0x72, 0x70, 0x49, 0x09, 0xa4, 0x69};
+
+    uint8 anchor_uuids[7][8] = {
+        {0xb9, 0x1c, 0x2e, 0x64, 0xe3, 0x31, 0x82, 0x70}, 
+        {0x6e, 0x18, 0x72, 0x70, 0x49, 0x09, 0xa4, 0x69},
+        {0x39, 0x39, 0xcf, 0x15, 0x64, 0x6b, 0xec, 0xd5},
+        {0xfe, 0xfd, 0x56, 0x80, 0x3a, 0x55, 0x67, 0xa9},
+        {0x3e, 0x04, 0xeb, 0x49, 0xd1, 0x4b, 0x3f, 0x7a},
+        {0x73, 0x0f, 0x83, 0x7b, 0xa0, 0x79, 0x88, 0x6a},
+        {0x3a, 0x2e, 0x08, 0x8a, 0x50, 0xb2, 0xfc, 0x3f},
+
+
+    };
+
+    int curr_anchor_uuid = 0;
+
+    // memcpy(&ranging_request_msg[ANCHOR_UUID_IDX], test_anchor_uuid, sizeof(test_anchor_uuid));
+    // memcpy(&ranging_request_response_msg[ANCHOR_UUID_IDX], test_anchor_uuid, sizeof(test_anchor_uuid));
+    // memcpy(&ranging_final_msg[ANCHOR_UUID_IDX], test_anchor_uuid, sizeof(test_anchor_uuid));
+    // memcpy(&distance_relay_msg[ANCHOR_UUID_IDX], test_anchor_uuid, sizeof(test_anchor_uuid));
+
+
 
     /* Loop forever initiating ranging exchanges. */
     while (1)
     {
+        ++curr_anchor_uuid;
+        if (curr_anchor_uuid > 6)
+            curr_anchor_uuid = 0;
+
+
+        memcpy(&ranging_request_msg[ANCHOR_UUID_IDX], anchor_uuids[curr_anchor_uuid], sizeof(anchor_uuids[curr_anchor_uuid]));
+        memcpy(&ranging_request_response_msg[ANCHOR_UUID_IDX], anchor_uuids[curr_anchor_uuid], sizeof(anchor_uuids[curr_anchor_uuid]));
+        memcpy(&ranging_final_msg[ANCHOR_UUID_IDX], anchor_uuids[curr_anchor_uuid], sizeof(anchor_uuids[curr_anchor_uuid]));
+        memcpy(&distance_relay_msg[ANCHOR_UUID_IDX], anchor_uuids[curr_anchor_uuid], sizeof(anchor_uuids[curr_anchor_uuid]));
+
+
+
         /* Ranging routine timing */
         timing_t start_time, end_time;
         uint64_t total_cycles;
@@ -203,9 +271,8 @@ int main(void)
         start_time = timing_counter_get();
 
         /* Write frame data to DW1000 and prepare transmission. See NOTE 8 below. */
-        tx_poll_msg[ALL_MSG_SN_IDX] = frame_seq_nb;
-        dwt_writetxdata(sizeof(tx_poll_msg), tx_poll_msg, 0); /* Zero offset in TX buffer. */
-        dwt_writetxfctrl(sizeof(tx_poll_msg), 0, 1);          /* Zero offset in TX buffer, ranging. */
+        dwt_writetxdata(sizeof(ranging_request_msg), ranging_request_msg, 0); /* Zero offset in TX buffer. */
+        dwt_writetxfctrl(sizeof(ranging_request_msg), 0, 1);          /* Zero offset in TX buffer, ranging. */
 
         /* Start transmission, indicating that a response is expected so that reception is enabled automatically after the frame is sent and the delay
          * set by dwt_setrxaftertxdelay() has elapsed. */
@@ -215,9 +282,6 @@ int main(void)
         while (!((status_reg = dwt_read32bitreg(SYS_STATUS_ID)) & (SYS_STATUS_RXFCG | SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR)))
         {
         };
-
-        /* Increment frame sequence number after transmission of the poll message (modulo 256). */
-        frame_seq_nb++;
 
         if (status_reg & SYS_STATUS_RXFCG)
         {
@@ -235,8 +299,7 @@ int main(void)
 
             /* Check that the frame is the expected response from the companion "DS TWR responder" example.
              * As the sequence number field of the frame is not relevant, it is cleared to simplify the validation of the frame. */
-            rx_buffer[ALL_MSG_SN_IDX] = 0;
-            if (memcmp(rx_buffer, rx_resp_msg, ALL_MSG_COMMON_LEN) == 0)
+            if (memcmp(rx_buffer, ranging_request_response_msg, ALL_MSG_COMMON_LEN) == 0)
             {
                 uint32 final_tx_time;
                 int ret;
@@ -253,14 +316,13 @@ int main(void)
                 final_tx_ts = (((uint64)(final_tx_time & 0xFFFFFFFEUL)) << 8) + TX_ANT_DLY;
 
                 /* Write all timestamps in the final message. See NOTE 11 below. */
-                final_msg_set_ts(&tx_final_msg[FINAL_MSG_POLL_TX_TS_IDX], poll_tx_ts);
-                final_msg_set_ts(&tx_final_msg[FINAL_MSG_RESP_RX_TS_IDX], resp_rx_ts);
-                final_msg_set_ts(&tx_final_msg[FINAL_MSG_FINAL_TX_TS_IDX], final_tx_ts);
+                final_msg_set_ts(&ranging_final_msg[FINAL_MSG_POLL_TX_TS_IDX], poll_tx_ts);
+                final_msg_set_ts(&ranging_final_msg[FINAL_MSG_RESP_RX_TS_IDX], resp_rx_ts);
+                final_msg_set_ts(&ranging_final_msg[FINAL_MSG_FINAL_TX_TS_IDX], final_tx_ts);
 
                 /* Write and send final message. See NOTE 8 below. */
-                tx_final_msg[ALL_MSG_SN_IDX] = frame_seq_nb;
-                dwt_writetxdata(sizeof(tx_final_msg), tx_final_msg, 0); /* Zero offset in TX buffer. */
-                dwt_writetxfctrl(sizeof(tx_final_msg), 0, 0);           /* Zero offset in TX buffer, non-ranging. */
+                dwt_writetxdata(sizeof(ranging_final_msg), ranging_final_msg, 0); /* Zero offset in TX buffer. */
+                dwt_writetxfctrl(sizeof(ranging_final_msg), 0, 0);           /* Zero offset in TX buffer, non-ranging. */
                 ret = dwt_starttx(DWT_START_TX_DELAYED | DWT_RESPONSE_EXPECTED);
 
                 if (ret == DWT_SUCCESS)
@@ -282,14 +344,14 @@ int main(void)
                             dwt_readrxdata(rx_buffer, frame_len, 0);
                         }
 
-                        uint32_t distance_mm = (uint32_t)rx_buffer[3] << 24 |
-                                               (uint32_t)rx_buffer[2] << 16 |
-                                               (uint32_t)rx_buffer[1] << 8 |
-                                               (uint32_t)rx_buffer[0];
+                        uint32_t distance_mm = (uint32_t)rx_buffer[RELAY_MSG_DISTANCE_IDX + 3] << 24 |
+                                               (uint32_t)rx_buffer[RELAY_MSG_DISTANCE_IDX + 2] << 16 |
+                                               (uint32_t)rx_buffer[RELAY_MSG_DISTANCE_IDX + 1] << 8 |
+                                               (uint32_t)rx_buffer[RELAY_MSG_DISTANCE_IDX];
 
                         double distance = distance_mm / 1000000.0;
 
-                        LOG_INF("Distance (m): %f", distance);
+                        LOG_INF("Distance (m) from anchor %d: %f", curr_anchor_uuid, distance);
                     }
 
                     /* Clear TXFRS event. */
@@ -319,10 +381,10 @@ int main(void)
 
         timing_stop();
 
-        LOG_INF("Ranging time (ms): %llu", total_ns / 1000000UL);
+        // LOG_INF("Ranging time (ms): %llu", total_ns / 1000000UL);
 
         /* Execute a delay between ranging exchanges. */
-        k_msleep(RNG_DELAY_MS);
+        k_msleep(LOOP_DELAY_MS);
     }
 }
 
